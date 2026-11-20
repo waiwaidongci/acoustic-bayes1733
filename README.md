@@ -13,7 +13,8 @@ GaussianNB与分层交叉验证、混淆矩阵和后验解释。为桐弦研究�
 3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
 4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
 5. 复检批注：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+6. 漂移分界：为已完成研究补录样本归班与班次顺序，按指定故障的频谱质心求最低总分分界；发布后在研究页面可查。
+7. 审计：登录、来源修改、任务worker完成、业务说明批准、漂移任务与发布等事件。
 
 ## 快速启动
 
@@ -70,6 +71,32 @@ GaussianNB与分层交叉验证、混淆矩阵和后验解释，全部计算位�
 
 已知边界：独立同分布、特征条件独立和高斯类条件是假设；后验未校准。演示数据刻意有分离度，准确率不代表真实设备效果。使用分层折外验证，不提供外部最终测试集。
 
+## 声纹漂移分界（漂移分界页）
+
+同类故障的声纹从哪一班开始漂：先为已完成研究补录 **样本归班** 与 **班次顺序**，再按指定故障的频谱质心找分界。样本归班按来源保存为版本（`drift_shift_plans` / `drift_shift_assignments`）：更正归班时另起 `revision`，旧版本与其计算保持冻结，不做原地覆盖。
+
+计算口径（`backend/src/services/drift_algo.py`，纯计算不含数据库）：
+
+- 每个班次内按频谱质心升序保存；每段以该段全部样本的中位数为基准，成本为该段样本到中位数的 **绝对差之和**。
+- 每道分界加 **固定罚分**；总成本 = 各段绝对差之和 + 罚分 × 分界数，取总分最低的分法。
+- **每段至少三班**（`min_shifts=3`）。同分时逐个比较分界，取 **靠前（字典序更小）** 的一组；一组分界是另一组的前缀时，分界更少的一组更靠前。
+- 三个及以上班次、每班至少一件指定故障样本才可计算；班次数不足直接拒绝并给出错误。
+
+实现与性能约束：
+
+- 后缀动态规划，只保留「当前段」一个增量合并数组与长度 O(班次数) 的成本表；**不枚举 2^(k-1) 种分法，也不缓存 O(k^2) 个候选区间**。
+- 十万件样本分批（每批 1000 件）扫描，按 `(任务, 样本编号)` 唯一写入 `drift_samples`，**重试不会重复计入**。
+- 已算班次的成本落 `drift_costs` 与 `drift_jobs.checkpoint`；**中断后按已算班次续跑**，`running` 超过 120 秒无心跳的任务会被 worker 自动放回队列。
+- 任务按 `drift_jobs` 保存状态、错误与结果；失败可在页面「续跑 / 重试」。
+
+发布与版本：
+
+- 发布键为 `(归班 revision, 任务号)`；比较与写入在同一条 `UPDATE ... WHERE` 中完成，**并发发布时旧计算不会盖掉新版**，被跳过的发布会写审计。
+- **各段的班次与中位数齐全**、且总分 = 绝对差 + 罚分、班次/样本总数对得上，才允许替换上版；不齐则阻止发布。
+- 每个 `(来源, 故障)` 只保留一份已发布分界（`drift_results`），研究页面「漂移分界」列出已发布版本的段、中位数与分界。
+
+API：`GET/POST /drift/plans`、`GET /drift/plans/{id}`、`GET /drift/runs/{id}/labels`、`GET/POST /drift/jobs`、`GET /drift/jobs/{id}`、`POST /drift/jobs/{id}/retry`、`POST /drift/jobs/{id}/publish`、`GET /drift/results`。写操作限分析师/负责人，阅读者只读。
+
 ## 演示数据与一天剧本
 
 固定seed=42，3个来源 ` TX-202611-01/02/03`，每来源240条，共720条业务记录；三个账号和首轮种子任务。自然键检查后仅插入缺失数据，连跑seed不重复、不覆盖用户修改。`SEED_DEMO=true` 时启动自动执行；失败记录日志但不阻塞服务。首轮任务同样由独立worker真实计算。
@@ -106,3 +133,5 @@ backend/migrations/001_initial.sql
 共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
 
 测试及截图在批根 `test-artifacts/gb-0041/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。
+
+漂移分界的算法 oracle、断点续跑、幂等重试、版本发布与 HTTP 流程测试见 `backend/tests/`；在 `backend` 目录运行 `python -m pytest tests -q`（需要 `pytest`、`fakeredis`、`httpx`，不连接真实数据库与 Redis）。
